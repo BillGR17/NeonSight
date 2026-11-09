@@ -8,8 +8,6 @@
 
 #include <iostream>
 #include <cstdlib>
-#include <thread>
-#include <chrono>
 #include <filesystem>
 #include "config/CursorMeta.hpp"
 
@@ -163,8 +161,8 @@ void App::Run(const std::atomic<bool> &globalRunningFlag) {
       injector->ApplyCursor();
     }
 
-    // Prevent 100% CPU runaway, capping roughly relative to 60hz (handled somewhat by ImGui vsync)
-    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    // Frame pacing is handled by vsync (glfwSwapInterval(1) in ConfigWindow).
+    // An extra sleep here would only add input/UI latency without saving CPU.
   }
 }
 
