@@ -16,7 +16,7 @@ public:
 
 private:
   Display *display_{nullptr};
-  Window rootWindow_;
+  Window rootWindow_{None};
 };
 
 } // namespace NeonSight
