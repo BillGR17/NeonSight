@@ -362,7 +362,13 @@ bool ConfigWindow::Render() {
     if (showHotspotModal_) ImGui::OpenPopup("Set Cursor Hotspot");
     if (ImGui::BeginPopupModal("Set Cursor Hotspot", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
       ImGui::Text("Click image to set hotspot.");
-      ImVec2 imgSize(std::min(400.0f, (float)modalTextureW_ * 2.0f), std::min(400.0f, (float)modalTextureH_ * 2.0f));
+      // Preserve the image's aspect ratio when scaling up the preview (clamped to a
+      // 400x400 box) so non-square cursors are not stretched.
+      const float maxPreview = 400.0f;
+      const float texW = (modalTextureW_ > 0) ? (float)modalTextureW_ : 1.0f;
+      const float texH = (modalTextureH_ > 0) ? (float)modalTextureH_ : 1.0f;
+      const float previewScale = std::min(maxPreview / texW, maxPreview / texH);
+      ImVec2 imgSize(texW * previewScale, texH * previewScale);
       ImVec2 imgPos = ImGui::GetCursorScreenPos();
       ImGui::Image((void *)(intptr_t)modalTextureID_, imgSize);
       if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0)) {
