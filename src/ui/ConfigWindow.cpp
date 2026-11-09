@@ -105,14 +105,13 @@ bool ConfigWindow::Initialize() {
 
   // Set Window Icon using embedded thumb
   int iconW, iconH;
-  unsigned char *iconData = ImageLoader::LoadRawFromMemory(Thumb_data, Thumb_size, iconW, iconH, 64);
+  auto iconData = ImageLoader::LoadRawFromMemory(Thumb_data, Thumb_size, iconW, iconH, 64);
   if (iconData) {
     GLFWimage image;
     image.width = iconW;
     image.height = iconH;
-    image.pixels = iconData;
+    image.pixels = iconData->data();
     glfwSetWindowIcon(window_, 1, &image);
-    ImageLoader::FreeRaw(iconData);
   }
 
   ScanCursorDirectory();

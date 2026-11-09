@@ -137,19 +137,18 @@ TrayIcon::~TrayIcon() {
 bool TrayIcon::Initialize() {
   // Load icon once (shared by both paths)
   int outW = 0, outH = 0;
-  unsigned char *raw = ImageLoader::LoadRawFromMemory(Thumb_data, Thumb_size, outW, outH, 32);
+  auto raw = ImageLoader::LoadRawFromMemory(Thumb_data, Thumb_size, outW, outH, 32);
   if (raw) {
     iconW_ = 32;
     iconH_ = 32;
     iconPixels_.resize(static_cast<size_t>(iconW_ * iconH_ * 4));
     // Convert RGBA → ARGB big-endian (SNI spec §Icons)
     for (int i = 0; i < iconW_ * iconH_; ++i) {
-      iconPixels_[i * 4 + 0] = raw[i * 4 + 3]; // A
-      iconPixels_[i * 4 + 1] = raw[i * 4 + 0]; // R
-      iconPixels_[i * 4 + 2] = raw[i * 4 + 1]; // G
-      iconPixels_[i * 4 + 3] = raw[i * 4 + 2]; // B
+      iconPixels_[i * 4 + 0] = (*raw)[i * 4 + 3]; // A
+      iconPixels_[i * 4 + 1] = (*raw)[i * 4 + 0]; // R
+      iconPixels_[i * 4 + 2] = (*raw)[i * 4 + 1]; // G
+      iconPixels_[i * 4 + 3] = (*raw)[i * 4 + 2]; // B
     }
-    ImageLoader::FreeRaw(raw);
     std::cout << "[TrayIcon] Icon loaded (" << iconW_ << "x" << iconH_ << ")\n";
   } else {
     std::cerr << "[TrayIcon] Warning: failed to load icon pixmap\n";

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <string>
+#include <optional>
+#include <vector>
 
 #ifdef __linux__
 #include <X11/Xcursor/Xcursor.h>
@@ -19,10 +21,10 @@ public:
   // Load a PNG and upload it to the GPU, returning its OpenGL Texture ID for ImGui binding
   static GLuint LoadAsTexture(const std::string &filepath, int &outWidth, int &outHeight);
 
-  // Load a raw RGBA buffer (caller must free with FreeRaw)
-  static unsigned char *LoadRaw(const std::string &filepath, int &outWidth, int &outHeight, int requestedSize = 64);
-  static unsigned char *LoadRawFromMemory(const unsigned char *data, unsigned int size, int &outWidth, int &outHeight, int requestedSize = 64);
-  static void FreeRaw(unsigned char *data);
+  // Load a raw RGBA buffer (owned by the caller's std::vector, no manual free needed).
+  // Returns std::nullopt if the image cannot be decoded.
+  static std::optional<std::vector<unsigned char>> LoadRaw(const std::string &filepath, int &outWidth, int &outHeight, int requestedSize = 64);
+  static std::optional<std::vector<unsigned char>> LoadRawFromMemory(const unsigned char *data, unsigned int size, int &outWidth, int &outHeight, int requestedSize = 64);
 };
 
 } // namespace NeonSight
