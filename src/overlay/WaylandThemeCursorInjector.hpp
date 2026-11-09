@@ -14,9 +14,9 @@ public:
   void ApplyCursor() override;
   bool LoadCursor(const std::string &cursorData, int fallbackSize, float hotXPercent, float hotYPercent) override;
   void SetActive(bool active) override;
-  bool IsActive() const override;
+  [[nodiscard]] bool IsActive() const override;
   void RestoreAll() override;
-  bool IsRunning() const override;
+  [[nodiscard]] bool IsRunning() const override;
 
 private:
   enum class CompositorType { Generic, GNOME, KDE };
