@@ -22,8 +22,7 @@ public:
   // Get current global mouse position
   [[nodiscard]] virtual Point GetMousePosition() const = 0;
 
-  // Register a hotkey (simple for now: true if pressed)
-  // Could accept keycode and callback
+  // Register a hotkey: `callback` fires whenever the given keycode is pressed.
   using HotkeyCallback = std::function<void()>;
   virtual void RegisterHotkey(int keycode, HotkeyCallback callback) = 0;
 };

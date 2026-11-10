@@ -36,23 +36,39 @@ bool App::Initialize(bool forceX11) {
 
   inputManager_ = std::make_unique<X11InputManager>();
 
+  // Bring up an injector, keeping it only if it initialized successfully.
+  auto tryAddInjector = [this](std::unique_ptr<ICursorInjector> injector) -> bool {
+    if (injector->Initialize()) {
+      injectors_.push_back(std::move(injector));
+      return true;
+    }
+    return false;
+  };
+
   if (isWayland) {
-    std::cout << "Starting NeonSight Native Wayland Native Theme injector...\n";
-    auto waylandInjector = std::make_unique<WaylandThemeCursorInjector>();
-    if (waylandInjector->Initialize()) {
-      injectors_.push_back(std::move(waylandInjector));
+    // Native Wayland games can only be reached through the compositor's cursor —
+    // that's the theme injector.
+    std::cout << "Starting NeonSight Wayland theme injector (native Wayland games)...\n";
+    tryAddInjector(std::make_unique<WaylandThemeCursorInjector>());
+
+    // X11/XWayland games run on an X server (XWayland), so the hardware injector
+    // works there exactly as it does on a pure X11 session. Best-effort: if no X
+    // display is reachable we skip it instead of failing the whole app.
+    std::cout << "Starting NeonSight X11/XWayland hardware injector...\n";
+    if (!tryAddInjector(std::make_unique<X11CursorInjector>())) {
+      std::cerr << "Note: no X/XWayland display reachable — X11/XWayland game injection is disabled.\n";
     }
   } else {
     std::cout << "Starting NeonSight X11 overlay injector...\n";
-    auto x11Injector = std::make_unique<X11CursorInjector>();
-    if (x11Injector->Initialize()) {
-      injectors_.push_back(std::move(x11Injector));
-    }
+    tryAddInjector(std::make_unique<X11CursorInjector>());
   }
 
+  // The input manager is optional (global hotkeys are a stub today). On a pure
+  // Wayland session there may be no X display, so a failure must NOT prevent the
+  // app from starting — clear the pointer and continue.
   if (!inputManager_->Initialize()) {
-    std::cerr << "Failed to initialize input manager.\n";
-    return false;
+    std::cerr << "Note: X11 input manager unavailable (no X display). Continuing without global hotkeys.\n";
+    inputManager_.reset();
   }
 
   if (injectors_.empty()) {
@@ -112,18 +128,39 @@ bool App::Initialize(bool forceX11) {
     }
   });
 
-  trayIcon_ = std::make_unique<TrayIcon>([this]() {
-    if (uiWindow_) {
-      if (uiWindow_->IsVisible()) {
-        uiWindow_->Hide();
-      } else {
-        uiWindow_->Show();
-      }
+  // Toggle the config window. These run on the MAIN thread (see PumpActions()),
+  // so the GLFW show/hide calls inside are safe.
+  auto toggleWindow = [this]() {
+    if (!uiWindow_)
+      return;
+    if (uiWindow_->IsVisible())
+      uiWindow_->Hide();
+    else
+      uiWindow_->Show();
+  };
+
+  // Left-click the tray -> toggle the window.
+  trayIcon_ = std::make_unique<TrayIcon>(toggleWindow);
+
+  // Right-click tray -> context menu. Item ids match TrayIcon's GetLayout
+  // (1 = Show/Hide, 2 = Quit); dispatched on the main thread.
+  trayIcon_->SetMenuActionCallback([this, toggleWindow](int id) {
+    switch (id) {
+      case 1:
+        toggleWindow();
+        break;
+      case 2:
+        std::cout << "Tray menu: Quit requested.\n";
+        if (uiWindow_)
+          uiWindow_->Quit(); // -> Render() returns false -> clean shutdown + restore
+        break;
+      default:
+        break;
     }
   });
 
   if (!trayIcon_->Initialize()) {
-    std::cerr << "Warning: Failed to initialize Tray Icon. Minimize to tray will not work nicely.\n";
+    std::cerr << "Warning: Failed to initialize Tray Icon. Tray clicks will not work.\n";
   }
 
   isRunning_ = true;
@@ -146,6 +183,12 @@ void App::Run(const std::atomic<bool> &globalRunningFlag) {
     if (!anyRunning)
       break;
 
+    // Run any tray clicks that arrived on the DBus/X11 worker thread, here on the
+    // main thread so the show/hide (GLFW) calls inside them are safe.
+    if (trayIcon_) {
+      trayIcon_->PumpActions();
+    }
+
     // Let UI handle its events & draw calls
     if (!uiWindow_->Render()) {
       std::cout << "UI requested quit. Initiating shutdown...\n";
@@ -153,8 +196,10 @@ void App::Run(const std::atomic<bool> &globalRunningFlag) {
       break;
     }
 
-    // Process hardware inputs
-    inputManager_->Update();
+    // Process hardware inputs (optional — not present on pure Wayland sessions)
+    if (inputManager_) {
+      inputManager_->Update();
+    }
 
     // Push cursor into active window
     for (auto &injector : injectors_) {

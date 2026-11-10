@@ -41,6 +41,7 @@ static const char *SNI_INTROSPECT_XML = R"XML(
     <property name="AttentionMovieName"  type="s" access="read"/>
     <property name="ToolTip"      type="(sa(iiay)ss)" access="read"/>
     <property name="ItemIsMenu"   type="b" access="read"/>
+    <property name="Menu"         type="o" access="read"/>
     <method name="Activate">
       <arg name="x" type="i" direction="in"/>
       <arg name="y" type="i" direction="in"/>
@@ -89,6 +90,28 @@ namespace NeonSight {
 // Constructor / Destructor
 
 TrayIcon::TrayIcon(std::function<void()> onActivate) : onActivate_(std::move(onActivate)) {}
+
+// Enqueue an action requested from the DBus/X11 worker thread. Must be safe to
+// call concurrently with PumpActions() on the main thread.
+void TrayIcon::EnqueueAction(std::function<void()> action) {
+  if (!action)
+    return;
+  std::lock_guard<std::mutex> lock(actionMutex_);
+  pendingActions_.push_back(std::move(action));
+}
+
+// Drain queued actions and run them on the CALLING thread (the main loop), so
+// any GLFW window operations inside them are thread-safe.
+void TrayIcon::PumpActions() {
+  std::deque<std::function<void()>> actions;
+  {
+    std::lock_guard<std::mutex> lock(actionMutex_);
+    actions.swap(pendingActions_);
+  }
+  for (auto &action : actions) {
+    action();
+  }
+}
 
 TrayIcon::~TrayIcon() {
   // Shut down SNI
@@ -227,6 +250,10 @@ static void AppendToolTip(DBusMessageIter *iter, const std::vector<uint8_t> &pix
   dbus_message_iter_close_container(iter, &variant);
 }
 
+// Where our com.canonical.dbusmenu lives. Declared early because the property
+// handlers below advertise it via the item's "Menu" property.
+static const char *kMenuPath = "/StatusNotifierItem/Menu";
+
 // Handle a single Properties.Get or Properties.GetAll call
 static DBusHandlerResult HandlePropertiesGet(DBusConnection *conn, DBusMessage *msg, const std::vector<uint8_t> &pixels, int w, int h) {
   const char *iface = nullptr;
@@ -260,6 +287,14 @@ static DBusHandlerResult HandlePropertiesGet(DBusConnection *conn, DBusMessage *
     dbus_message_iter_append_basic(&v, DBUS_TYPE_UINT32, &val);
     dbus_message_iter_close_container(&iter, &v);
   };
+  // Object-path variant. The SNI "Menu" property is an object path ('o'), NOT a
+  // plain string — hosts validate the type, so returning 's' makes them drop it.
+  auto appendObjectPath = [&](const char *val) {
+    DBusMessageIter v;
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "o", &v);
+    dbus_message_iter_append_basic(&v, DBUS_TYPE_OBJECT_PATH, &val);
+    dbus_message_iter_close_container(&iter, &v);
+  };
 
   std::string pname(prop ? prop : "");
 
@@ -290,6 +325,10 @@ static DBusHandlerResult HandlePropertiesGet(DBusConnection *conn, DBusMessage *
       AppendIconPixmap(&iter, {}, 0, 0); // empty for overlay/attention
   } else if (pname == "ToolTip") {
     AppendToolTip(&iter, pixels, w, h);
+  } else if (pname == "Menu") {
+    // Path to our com.canonical.dbusmenu object. The SNI spec (and the Waybar
+    // host) require this to be an OBJECT PATH, so append it as type 'o'.
+    appendObjectPath(kMenuPath);
   } else {
     dbus_message_unref(reply);
     DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_UNKNOWN_PROPERTY, prop);
@@ -340,6 +379,16 @@ static DBusHandlerResult HandlePropertiesGetAll(DBusConnection *conn, DBusMessag
     dbus_message_iter_close_container(&entry, &v);
     dbus_message_iter_close_container(&dict, &entry);
   };
+  // "Menu" is an object path ('o') per the SNI spec.
+  auto addObjPath = [&](const char *key, const char *val) {
+    DBusMessageIter entry, v;
+    dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, nullptr, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "o", &v);
+    dbus_message_iter_append_basic(&v, DBUS_TYPE_OBJECT_PATH, &val);
+    dbus_message_iter_close_container(&entry, &v);
+    dbus_message_iter_close_container(&dict, &entry);
+  };
   auto addIconPixmap = [&](const char *key, const std::vector<uint8_t> &px, int pw, int ph) {
     DBusMessageIter entry;
     dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, nullptr, &entry);
@@ -369,12 +418,434 @@ static DBusHandlerResult HandlePropertiesGetAll(DBusConnection *conn, DBusMessag
   addIconPixmap("OverlayIconPixmap", {}, 0, 0);
   addIconPixmap("AttentionIconPixmap", {}, 0, 0);
   addToolTip("ToolTip");
+  addObjPath("Menu", kMenuPath); // where our com.canonical.dbusmenu lives (object path)
 
   dbus_message_iter_close_container(&iter, &dict);
   dbus_connection_send(conn, reply, nullptr);
   dbus_message_unref(reply);
   return DBUS_HANDLER_RESULT_HANDLED;
 }
+
+//  com.canonical.dbusmenu — the right-click menu the tray host renders.
+//  It lives at kMenuPath and is discovered by the host through the item's "Menu"
+//  string property (see HandlePropertiesGet/GetAll). Item ids are stable and
+//  advertised in GetLayout; when the user picks one, the host calls Event(id).
+
+// The menu we expose. Keep ids stable — App.cpp maps them to actions.
+struct MenuNode {
+  int id;
+  const char *label;
+};
+static const MenuNode kMenuItems[] = {
+  {1, "Show/Hide Window"},
+  {2, "Quit NeonSight"},
+};
+
+// Look up a menu item by id. Returns nullptr for ids we don't own.
+static const MenuNode *FindMenuItem(int id) {
+  for (const auto &n : kMenuItems)
+    if (n.id == id)
+      return &n;
+  return nullptr;
+}
+
+// Append one (string) property into an open a{sv} iter.
+static void MenuAddStrProp(DBusMessageIter *arr, const char *key, const char *val) {
+  DBusMessageIter entry, variant;
+  dbus_message_iter_open_container(arr, DBUS_TYPE_DICT_ENTRY, nullptr, &entry);
+  dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+  dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+  dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+  dbus_message_iter_close_container(&entry, &variant);
+  dbus_message_iter_close_container(arr, &entry);
+}
+
+// Append one (boolean) property into an open a{sv} iter.
+static void MenuAddBoolProp(DBusMessageIter *arr, const char *key, dbus_bool_t val) {
+  DBusMessageIter entry, variant;
+  dbus_message_iter_open_container(arr, DBUS_TYPE_DICT_ENTRY, nullptr, &entry);
+  dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+  dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "b", &variant);
+  dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &val);
+  dbus_message_iter_close_container(&entry, &variant);
+  dbus_message_iter_close_container(arr, &entry);
+}
+
+// Append a single node "(ia{sv}av)" as a variant into the children array iter.
+static void MenuAddChild(DBusMessageIter *childrenArr, int id, const char *label) {
+  DBusMessageIter variant, node, props, children;
+
+  dbus_message_iter_open_container(childrenArr, DBUS_TYPE_VARIANT, "(ia{sv}av)", &variant);
+  dbus_message_iter_open_container(&variant, DBUS_TYPE_STRUCT, nullptr, &node);
+
+  dbus_message_iter_append_basic(&node, DBUS_TYPE_INT32, &id);
+
+  dbus_message_iter_open_container(&node, DBUS_TYPE_ARRAY, "{sv}", &props);
+  MenuAddStrProp(&props, "label", label);
+  MenuAddStrProp(&props, "type", "standard");
+  MenuAddBoolProp(&props, "enabled", TRUE);
+  MenuAddBoolProp(&props, "visible", TRUE);
+  dbus_message_iter_close_container(&node, &props);
+
+  // No sub-menu: empty children array.
+  dbus_message_iter_open_container(&node, DBUS_TYPE_ARRAY, DBUS_TYPE_VARIANT_AS_STRING, &children);
+  dbus_message_iter_close_container(&node, &children);
+
+  dbus_message_iter_close_container(&variant, &node);
+  dbus_message_iter_close_container(childrenArr, &variant);
+}
+
+// GetLayout(i i as) -> (u (ia{sv}av))
+static DBusHandlerResult HandleDBusMenuGetLayout(DBusConnection *conn, DBusMessage *msg) {
+  DBusMessage *reply = dbus_message_new_method_return(msg);
+  if (!reply)
+    return DBUS_HANDLER_RESULT_NEED_MEMORY;
+
+  DBusMessageIter iter, root, rootProps, rootChildren;
+  dbus_message_iter_init_append(reply, &iter);
+
+  dbus_uint32_t revision = 0;
+  dbus_message_iter_append_basic(&iter, DBUS_TYPE_UINT32, &revision);
+
+  // Root node: (id=0, props={children-display: submenu}, children=[ ... ])
+  dbus_message_iter_open_container(&iter, DBUS_TYPE_STRUCT, nullptr, &root);
+  dbus_int32_t rootId = 0;
+  dbus_message_iter_append_basic(&root, DBUS_TYPE_INT32, &rootId);
+
+  dbus_message_iter_open_container(&root, DBUS_TYPE_ARRAY, "{sv}", &rootProps);
+  MenuAddStrProp(&rootProps, "children-display", "submenu");
+  dbus_message_iter_close_container(&root, &rootProps);
+
+  dbus_message_iter_open_container(&root, DBUS_TYPE_ARRAY, DBUS_TYPE_VARIANT_AS_STRING, &rootChildren);
+  for (const auto &item : kMenuItems)
+    MenuAddChild(&rootChildren, item.id, item.label);
+  dbus_message_iter_close_container(&root, &rootChildren);
+
+  dbus_message_iter_close_container(&iter, &root);
+
+  dbus_connection_send(conn, reply, nullptr);
+  dbus_message_unref(reply);
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+// AboutToShow(i) -> (b). We have a static menu: nothing to refresh.
+static DBusHandlerResult HandleDBusMenuAboutToShow(DBusConnection *conn, DBusMessage *msg) {
+  DBusMessage *reply = dbus_message_new_method_return(msg);
+  if (!reply)
+    return DBUS_HANDLER_RESULT_NEED_MEMORY;
+  dbus_bool_t needUpdate = FALSE;
+  dbus_message_append_args(reply, DBUS_TYPE_BOOLEAN, &needUpdate, DBUS_TYPE_INVALID);
+  dbus_connection_send(conn, reply, nullptr);
+  dbus_message_unref(reply);
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+// AboutToShowGroup(ai) -> (aib). Batch form of AboutToShow used by some hosts
+// (this Waybar fork). Reply with the same parent ids, each flagged needUpdate=false.
+static DBusHandlerResult HandleDBusMenuAboutToShowGroup(DBusConnection *conn, DBusMessage *msg) {
+  DBusMessage *reply = dbus_message_new_method_return(msg);
+  if (!reply)
+    return DBUS_HANDLER_RESULT_NEED_MEMORY;
+
+  DBusMessageIter iter, outArray, pair;
+  dbus_message_iter_init_append(reply, &iter);
+  dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "(ib)", &outArray);
+
+  // Recurse into the single ai arg. After recurse the iterator sits ON the first
+  // element (or DBUS_TYPE_INVALID if the array is empty), so process-then-advance.
+  DBusMessageIter outer, inner;
+  dbus_message_iter_init(msg, &outer);
+  dbus_message_iter_recurse(&outer, &inner);
+  while (dbus_message_iter_get_arg_type(&inner) != DBUS_TYPE_INVALID) {
+    dbus_int32_t id = 0;
+    dbus_message_iter_get_basic(&inner, &id);
+    dbus_bool_t needUpdate = FALSE;
+    dbus_message_iter_open_container(&outArray, DBUS_TYPE_STRUCT, nullptr, &pair);
+    dbus_message_iter_append_basic(&pair, DBUS_TYPE_INT32, &id);
+    dbus_message_iter_append_basic(&pair, DBUS_TYPE_BOOLEAN, &needUpdate);
+    dbus_message_iter_close_container(&outArray, &pair);
+    dbus_message_iter_next(&inner);
+  }
+  dbus_message_iter_close_container(&iter, &outArray);
+
+  dbus_connection_send(conn, reply, nullptr);
+  dbus_message_unref(reply);
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+// GetGroupProperties(ai as) -> (a(ia{sv})). Return properties for the requested
+// ids. Some hosts use this to (re)query item properties after GetLayout.
+static DBusHandlerResult HandleDBusMenuGetGroupProperties(DBusConnection *conn, DBusMessage *msg) {
+  DBusMessage *reply = dbus_message_new_method_return(msg);
+  if (!reply)
+    return DBUS_HANDLER_RESULT_NEED_MEMORY;
+
+  DBusMessageIter iter, arr;
+  dbus_message_iter_init_append(reply, &iter);
+  dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "(ia{sv})", &arr);
+  for (const auto &item : kMenuItems) {
+    DBusMessageIter entry, props;
+    dbus_message_iter_open_container(&arr, DBUS_TYPE_STRUCT, nullptr, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_INT32, &item.id);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_ARRAY, "{sv}", &props);
+    MenuAddStrProp(&props, "label", item.label);
+    MenuAddStrProp(&props, "type", "standard");
+    MenuAddBoolProp(&props, "enabled", TRUE);
+    dbus_message_iter_close_container(&entry, &props);
+    dbus_message_iter_close_container(&arr, &entry);
+  }
+  dbus_message_iter_close_container(&iter, &arr);
+
+  dbus_connection_send(conn, reply, nullptr);
+  dbus_message_unref(reply);
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+// GetProperty(i s) -> (v)
+static DBusHandlerResult HandleDBusMenuGetProperty(DBusConnection *conn, DBusMessage *msg) {
+  int32_t id = 0;
+  const char *name = nullptr;
+  if (!dbus_message_get_args(msg, nullptr, DBUS_TYPE_INT32, &id, DBUS_TYPE_STRING, &name, DBUS_TYPE_INVALID))
+    return DBUS_HANDLER_RESULT_HANDLED;
+
+  DBusMessage *reply = dbus_message_new_method_return(msg);
+  if (!reply)
+    return DBUS_HANDLER_RESULT_NEED_MEMORY;
+
+  const MenuNode *node = FindMenuItem(id);
+  DBusMessageIter iter, variant;
+  dbus_message_iter_init_append(reply, &iter);
+
+  if (name && strcmp(name, "label") == 0 && node) {
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &node->label);
+    dbus_message_iter_close_container(&iter, &variant);
+  } else if (name && strcmp(name, "type") == 0 && node) {
+    const char *t = "standard";
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &t);
+    dbus_message_iter_close_container(&iter, &variant);
+  } else if (name && strcmp(name, "enabled") == 0) {
+    dbus_bool_t b = TRUE;
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "b", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &b);
+    dbus_message_iter_close_container(&iter, &variant);
+  } else {
+    // Unknown id/property -> empty variant (accepted by hosts).
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "", &variant);
+    dbus_message_iter_close_container(&iter, &variant);
+  }
+
+  dbus_connection_send(conn, reply, nullptr);
+  dbus_message_unref(reply);
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+// GetChildren(i) -> (ai)
+static DBusHandlerResult HandleDBusMenuGetChildren(DBusConnection *conn, DBusMessage *msg) {
+  int32_t id = 0;
+  dbus_message_get_args(msg, nullptr, DBUS_TYPE_INT32, &id, DBUS_TYPE_INVALID);
+
+  DBusMessage *reply = dbus_message_new_method_return(msg);
+  if (!reply)
+    return DBUS_HANDLER_RESULT_NEED_MEMORY;
+
+  DBusMessageIter iter, arr;
+  dbus_message_iter_init_append(reply, &iter);
+  dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, DBUS_TYPE_INT32_AS_STRING, &arr);
+  if (id == 0) {
+    for (const auto &item : kMenuItems)
+      dbus_message_iter_append_basic(&arr, DBUS_TYPE_INT32, &item.id);
+  }
+  dbus_message_iter_close_container(&iter, &arr);
+
+  dbus_connection_send(conn, reply, nullptr);
+  dbus_message_unref(reply);
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+// Properties.Get on the menu interface — hosts read Version to confirm the
+// dbusmenu version (3 is the stable spec version we implement).
+static DBusHandlerResult HandleMenuPropertiesGet(DBusConnection *conn, DBusMessage *msg) {
+  const char *iface = nullptr;
+  const char *prop = nullptr;
+  dbus_message_get_args(msg, nullptr, DBUS_TYPE_STRING, &iface, DBUS_TYPE_STRING, &prop, DBUS_TYPE_INVALID);
+
+  DBusMessage *reply = dbus_message_new_method_return(msg);
+  if (!reply)
+    return DBUS_HANDLER_RESULT_NEED_MEMORY;
+
+  DBusMessageIter iter, variant;
+  dbus_message_iter_init_append(reply, &iter);
+  if (prop && strcmp(prop, "Version") == 0) {
+    dbus_uint32_t v = 3;
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "u", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_UINT32, &v);
+    dbus_message_iter_close_container(&iter, &variant);
+  } else if (prop && strcmp(prop, "Status") == 0) {
+    const char *s = "normal";
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &s);
+    dbus_message_iter_close_container(&iter, &variant);
+  } else {
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "", &variant);
+    dbus_message_iter_close_container(&iter, &variant);
+  }
+
+  dbus_connection_send(conn, reply, nullptr);
+  dbus_message_unref(reply);
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+static DBusHandlerResult HandleMenuPropertiesGetAll(DBusConnection *conn, DBusMessage *msg) {
+  DBusMessage *reply = dbus_message_new_method_return(msg);
+  if (!reply)
+    return DBUS_HANDLER_RESULT_NEED_MEMORY;
+
+  DBusMessageIter iter, arr, entry, variant;
+  dbus_message_iter_init_append(reply, &iter);
+  dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{sv}", &arr);
+  dbus_message_iter_open_container(&arr, DBUS_TYPE_DICT_ENTRY, nullptr, &entry);
+  const char *key = "Version";
+  dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+  dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "u", &variant);
+  dbus_uint32_t v = 3;
+  dbus_message_iter_append_basic(&variant, DBUS_TYPE_UINT32, &v);
+  dbus_message_iter_close_container(&entry, &variant);
+  dbus_message_iter_close_container(&arr, &entry);
+  dbus_message_iter_close_container(&iter, &arr);
+
+  dbus_connection_send(conn, reply, nullptr);
+  dbus_message_unref(reply);
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+// Event(i s v u) — a menu item was activated by the user. Dispatch to the app
+// on the main thread (EnqueueAction). Only "clicked" is meaningful.
+static DBusHandlerResult HandleDBusMenuEvent(DBusConnection *conn, DBusMessage *msg, void *data) {
+  int32_t id = 0;
+  const char *eventId = nullptr;
+  dbus_message_get_args(msg, nullptr, DBUS_TYPE_INT32, &id, DBUS_TYPE_STRING, &eventId,
+                        DBUS_TYPE_VARIANT, DBUS_TYPE_INVALID, DBUS_TYPE_UINT32, DBUS_TYPE_INVALID);
+
+  auto *self = static_cast<TrayIcon *>(data);
+  if (eventId && strcmp(eventId, "clicked") == 0) {
+    // Capture the id; run the (main-thread) callback later via the public accessor.
+    int captured = id;
+    self->EnqueueAction([self, captured]() { self->InvokeMenuAction(captured); });
+  }
+
+  DBusMessage *reply = dbus_message_new_method_return(msg);
+  if (reply) {
+    dbus_connection_send(conn, reply, nullptr);
+    dbus_message_unref(reply);
+  }
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+// EventGroup(a(isvu)) — the batch form of Event. Each entry is
+// (id, eventId, data, timestamp). Hosts like this Waybar fork send item
+// selections HERE rather than via the singular Event, so we must dispatch each
+// "clicked" entry to the app (enqueued -> run on the main thread).
+static DBusHandlerResult HandleDBusMenuEventGroup(DBusConnection *conn, DBusMessage *msg, void *data) {
+  auto *self = static_cast<TrayIcon *>(data);
+
+  DBusMessageIter outer, entry;
+  dbus_message_iter_init(msg, &outer);
+  dbus_message_iter_recurse(&outer, &entry); // entry at first (isvu) struct
+
+  while (dbus_message_iter_get_arg_type(&entry) != DBUS_TYPE_INVALID) {
+    // entry is a struct; recurse to read its fields (id, eventId, ...).
+    DBusMessageIter fields;
+    dbus_message_iter_recurse(&entry, &fields); // fields at field 0 (id)
+    int32_t id = 0;
+    dbus_message_iter_get_basic(&fields, &id);
+    dbus_message_iter_next(&fields); // -> field 1 (eventId string)
+    const char *eventId = nullptr;
+    dbus_message_iter_get_basic(&fields, &eventId);
+
+    if (eventId && strcmp(eventId, "clicked") == 0) {
+      int captured = id;
+      self->EnqueueAction([self, captured]() { self->InvokeMenuAction(captured); });
+    }
+    dbus_message_iter_next(&entry); // -> next (isvu) struct
+  }
+
+  DBusMessage *reply = dbus_message_new_method_return(msg);
+  if (reply) {
+    dbus_connection_send(conn, reply, nullptr);
+    dbus_message_unref(reply);
+  }
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+static const char *DBUSMENU_INTROSPECT_XML = R"XML(
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+  "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node name="/StatusNotifierItem/Menu">
+  <interface name="com.canonical.dbusmenu">
+    <property name="Version" type="u" access="read"/>
+    <method name="GetLayout">
+      <arg name="parentId" type="i" direction="in"/>
+      <arg name="recursionDepth" type="i" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
+      <arg name="revision" type="u" direction="out"/>
+      <arg name="layout" type="(ia{sv}av)" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
+      <arg name="properties" type="a(ia{sv})" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+      <arg name="value" type="v" direction="out"/>
+    </method>
+    <method name="GetChildren">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="ids" type="ai" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="eventId" type="s" direction="in"/>
+      <arg name="data" type="v" direction="in"/>
+      <arg name="timestamp" type="u" direction="in"/>
+    </method>
+    <method name="EventGroup">
+      <arg name="events" type="a(isvu)" direction="in"/>
+    </method>
+    <method name="AboutToShow">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="needUpdate" type="b" direction="out"/>
+    </method>
+    <method name="AboutToShowGroup">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg name="needUpdate" type="aib" direction="out"/>
+    </method>
+    <signal name="LayoutUpdated">
+      <arg name="revision" type="u"/>
+      <arg name="parent" type="i"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg name="interface_name" type="s" direction="in"/>
+      <arg name="property_name" type="s" direction="in"/>
+      <arg name="value" type="v" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg name="interface_name" type="s" direction="in"/>
+      <arg name="props" type="a{sv}" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg name="xml_data" type="s" direction="out"/>
+    </method>
+  </interface>
+</node>
+)XML";
 
 // libdbus message filter / dispatcher
 /* static */ int TrayIcon::SNIFilterFunc(DBusConnection *conn, void *rawMsg, void *data) {
@@ -386,42 +857,73 @@ static DBusHandlerResult HandlePropertiesGetAll(DBusConnection *conn, DBusMessag
   const char *member = dbus_message_get_member(msg);
   int type = dbus_message_get_type(msg);
 
-  if (!path || strcmp(path, "/StatusNotifierItem") != 0)
+  const bool isMenu = path && strcmp(path, kMenuPath) == 0;
+  const bool isItem = path && strcmp(path, "/StatusNotifierItem") == 0;
+  if (!isMenu && !isItem)
     return static_cast<int>(DBUS_HANDLER_RESULT_NOT_YET_HANDLED);
 
   // Introspect
   if (type == DBUS_MESSAGE_TYPE_METHOD_CALL && iface && strcmp(iface, "org.freedesktop.DBus.Introspectable") == 0 && member &&
       strcmp(member, "Introspect") == 0) {
+    const char *xml = isMenu ? DBUSMENU_INTROSPECT_XML : SNI_INTROSPECT_XML;
     DBusMessage *reply = dbus_message_new_method_return(msg);
     if (reply) {
-      dbus_message_append_args(reply, DBUS_TYPE_STRING, &SNI_INTROSPECT_XML, DBUS_TYPE_INVALID);
+      dbus_message_append_args(reply, DBUS_TYPE_STRING, &xml, DBUS_TYPE_INVALID);
       dbus_connection_send(conn, reply, nullptr);
       dbus_message_unref(reply);
     }
     return static_cast<int>(DBUS_HANDLER_RESULT_HANDLED);
   }
 
-  // Properties.Get
-  if (type == DBUS_MESSAGE_TYPE_METHOD_CALL && iface && strcmp(iface, "org.freedesktop.DBus.Properties") == 0 && member &&
-      strcmp(member, "Get") == 0) {
-    return static_cast<int>(HandlePropertiesGet(conn, msg, self->iconPixels_, self->iconW_, self->iconH_));
+  // com.canonical.dbusmenu (the menu object)
+  if (isMenu && type == DBUS_MESSAGE_TYPE_METHOD_CALL && iface && strcmp(iface, "com.canonical.dbusmenu") == 0 && member) {
+    if (strcmp(member, "GetLayout") == 0)
+      return static_cast<int>(HandleDBusMenuGetLayout(conn, msg));
+    if (strcmp(member, "AboutToShow") == 0)
+      return static_cast<int>(HandleDBusMenuAboutToShow(conn, msg));
+    if (strcmp(member, "AboutToShowGroup") == 0)
+      return static_cast<int>(HandleDBusMenuAboutToShowGroup(conn, msg));
+    if (strcmp(member, "GetGroupProperties") == 0)
+      return static_cast<int>(HandleDBusMenuGetGroupProperties(conn, msg));
+    if (strcmp(member, "GetProperty") == 0)
+      return static_cast<int>(HandleDBusMenuGetProperty(conn, msg));
+    if (strcmp(member, "GetChildren") == 0)
+      return static_cast<int>(HandleDBusMenuGetChildren(conn, msg));
+    if (strcmp(member, "Event") == 0)
+      return static_cast<int>(HandleDBusMenuEvent(conn, msg, self));
+    if (strcmp(member, "EventGroup") == 0)
+      return static_cast<int>(HandleDBusMenuEventGroup(conn, msg, self));
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) {
+      dbus_connection_send(conn, reply, nullptr);
+      dbus_message_unref(reply);
+    }
+    return static_cast<int>(DBUS_HANDLER_RESULT_HANDLED);
   }
 
-  // Properties.GetAll
-  if (type == DBUS_MESSAGE_TYPE_METHOD_CALL && iface && strcmp(iface, "org.freedesktop.DBus.Properties") == 0 && member &&
-      strcmp(member, "GetAll") == 0) {
-    return static_cast<int>(HandlePropertiesGetAll(conn, msg, self->iconPixels_, self->iconW_, self->iconH_));
+  // Properties (Get/GetAll) — routed to the item or the menu object.
+  if (type == DBUS_MESSAGE_TYPE_METHOD_CALL && iface && strcmp(iface, "org.freedesktop.DBus.Properties") == 0 && member) {
+    if (strcmp(member, "Get") == 0)
+      return isMenu ? static_cast<int>(HandleMenuPropertiesGet(conn, msg))
+                    : static_cast<int>(HandlePropertiesGet(conn, msg, self->iconPixels_, self->iconW_, self->iconH_));
+    if (strcmp(member, "GetAll") == 0)
+      return isMenu ? static_cast<int>(HandleMenuPropertiesGetAll(conn, msg))
+                    : static_cast<int>(HandlePropertiesGetAll(conn, msg, self->iconPixels_, self->iconW_, self->iconH_));
   }
 
-  // SNI Methods
-  if (type == DBUS_MESSAGE_TYPE_METHOD_CALL && iface &&
+  // SNI Methods (item object only)
+  if (isItem && type == DBUS_MESSAGE_TYPE_METHOD_CALL && iface &&
       (strcmp(iface, "org.kde.StatusNotifierItem") == 0 || strcmp(iface, "org.freedesktop.StatusNotifierItem") == 0)) {
 
+    // Left-click: toggle the window. This arrives on the worker thread, but the
+    // callback touches GLFW (only safe on the main thread), so we enqueue it —
+    // the main loop runs it via PumpActions().
     if (member && strcmp(member, "Activate") == 0) {
-      if (self->onActivate_)
-        self->onActivate_();
+      self->EnqueueAction(self->onActivate_);
     }
-    // SecondaryActivate / ContextMenu / Scroll — silently accepted
+    // ContextMenu / SecondaryActivate / Scroll: the tray host renders our
+    // com.canonical.dbusmenu itself (it finds it via the "Menu" property); item
+    // selections come back through the menu's Event() method. We just ack these.
     DBusMessage *reply = dbus_message_new_method_return(msg);
     if (reply) {
       dbus_connection_send(conn, reply, nullptr);
@@ -672,8 +1174,11 @@ void TrayIcon::XEmbedLoop() {
       }
     }
 
-    if (ev.type == ButtonPress && ev.xbutton.button == Button1 && onActivate_) {
-      onActivate_();
+    // Left-click (Button1) -> activate. Enqueue rather than call directly: this
+    // runs on the X11 worker thread and the callback touches GLFW (main thread).
+    // Right-click has no dbusmenu equivalent on a plain X11 tray — leave as no-op.
+    if (ev.type == ButtonPress && ev.xbutton.button == Button1) {
+      EnqueueAction(onActivate_);
     }
   }
 

@@ -19,13 +19,14 @@ public:
   [[nodiscard]] bool IsRunning() const override;
 
 private:
-  enum class CompositorType { Generic, GNOME, KDE };
+  enum class CompositorType { Generic, GNOME, KDE, Hyprland };
 
   void ApplyThemeSystemWide();
 
   std::string defaultTheme_{"Adwaita"};
   int defaultSize_{24};
   bool isActive_{false};
+  bool applied_{false}; // whether the NeonSight theme is actually applied system-wide
   int currentSize_{32};
   CompositorType compositor_{CompositorType::Generic};
 };

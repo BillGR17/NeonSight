@@ -48,6 +48,10 @@ private:
   void ScanCursorDirectory();
   void DeleteCursor(CursorAsset &asset);
 
+  // Populate the hotspot modal for the given cursor (used both by the explicit
+  // "Set Cursor Hotspot" button and by clicking an unconfigured cursor).
+  void BeginHotspotModal(const CursorAsset &cursor, float hotX, float hotY);
+
   GLFWwindow *window_{nullptr};
 
   std::vector<CursorAsset> availableCursors_;
@@ -72,6 +76,8 @@ private:
   bool showExitModal_{false};
   bool hidden_{false};
   bool shouldQuit_{false};
+
+  int confirmDeleteIdx_{-1}; // index of the cursor pending delete confirmation
 
   ImGui::FileBrowser fileDialog_;
 };

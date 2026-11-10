@@ -98,7 +98,8 @@ bool ConfigWindow::Initialize() {
   fileDialog_.SetTitle("Select Custom Cursor (*.svg, *.png)");
   fileDialog_.SetTypeFilters({".svg", ".png"});
 
-  AppConfig::Get().Load();
+  // The config was already loaded above (for the theme) — nothing mutates it in
+  // between, so no need to re-read the file.
   cursorSize_ = AppConfig::Get().cursorSize;
   isCursorEnabled_ = AppConfig::Get().isCursorEnabled;
   currentSelection_ = AppConfig::Get().activeCursor;
@@ -202,6 +203,17 @@ void ConfigWindow::ScanCursorDirectory() {
   }
 }
 
+void ConfigWindow::BeginHotspotModal(const CursorAsset &cursor, float hotX, float hotY) {
+  showHotspotModal_ = true;
+  modalCursorFile_ = cursor.filename;
+  modalMetaPath_ = cursor.metaPath;
+  modalTextureID_ = cursor.textureID;
+  modalTextureW_ = cursor.width;
+  modalTextureH_ = cursor.height;
+  modalHotX_ = hotX;
+  modalHotY_ = hotY;
+}
+
 void ConfigWindow::DeleteCursor(CursorAsset &asset) {
   std::error_code ec;
   if (asset.textureID) glDeleteTextures(1, &asset.textureID);
@@ -242,7 +254,6 @@ bool ConfigWindow::Render() {
   ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
 
   int pendingDelete = -1;
-  static int confirmDeleteIdx = -1;
 
   if (ImGui::Begin("NeonSight Setup", nullptr, flags)) {
     bool configChanged = false;
@@ -257,14 +268,7 @@ bool ConfigWindow::Render() {
     if (ImGui::Button("Set Cursor Hotspot") && !currentSelection_.empty()) {
       for (const auto &cursor : availableCursors_) {
         if (cursor.filename == currentSelection_) {
-          showHotspotModal_ = true;
-          modalCursorFile_ = cursor.filename;
-          modalMetaPath_ = cursor.metaPath;
-          modalTextureID_ = cursor.textureID;
-          modalTextureW_ = cursor.width;
-          modalTextureH_ = cursor.height;
-          modalHotX_ = cursor.meta.hotspotX;
-          modalHotY_ = cursor.meta.hotspotY;
+          BeginHotspotModal(cursor, cursor.meta.hotspotX, cursor.meta.hotspotY);
           break;
         }
       }
@@ -303,14 +307,7 @@ bool ConfigWindow::Render() {
           ImGui::PushID(i);
           if (ImGui::ImageButton(cursor.filename.c_str(), (void *)(intptr_t)cursor.textureID, ImVec2(100, 100))) {
             if (!cursor.isConfigured) {
-              showHotspotModal_ = true;
-              modalCursorFile_ = cursor.filename;
-              modalMetaPath_ = cursor.metaPath;
-              modalTextureID_ = cursor.textureID;
-              modalTextureW_ = cursor.width;
-              modalTextureH_ = cursor.height;
-              modalHotX_ = 0.5f;
-              modalHotY_ = 0.5f;
+              BeginHotspotModal(cursor, 0.5f, 0.5f);
             } else {
               currentSelection_ = cursor.filename;
               hotspotX_ = cursor.meta.hotspotX;
@@ -327,7 +324,7 @@ bool ConfigWindow::Render() {
           float offX = (ImGui::GetColumnWidth() - 64.0f) * 0.5f;
           if (offX > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offX);
           if (ImGui::Button("Delete", ImVec2(64.0f, 22.0f))) {
-            confirmDeleteIdx = i;
+            confirmDeleteIdx_ = i;
             ImGui::OpenPopup("Delete Cursor?");
           }
           ImGui::PopStyleColor();
@@ -350,12 +347,12 @@ bool ConfigWindow::Render() {
       onConfigChanged_(path, cursorSize_, isCursorEnabled_, hotspotX_, hotspotY_);
     }
 
-    if (confirmDeleteIdx >= 0) ImGui::OpenPopup("Delete Cursor?");
+    if (confirmDeleteIdx_ >= 0) ImGui::OpenPopup("Delete Cursor?");
     if (ImGui::BeginPopupModal("Delete Cursor?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Text("Are you sure you want to delete this cursor?");
-        if (ImGui::Button("Delete", ImVec2(120, 0))) { pendingDelete = confirmDeleteIdx; confirmDeleteIdx = -1; ImGui::CloseCurrentPopup(); }
+        if (ImGui::Button("Delete", ImVec2(120, 0))) { pendingDelete = confirmDeleteIdx_; confirmDeleteIdx_ = -1; ImGui::CloseCurrentPopup(); }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(120, 0))) { confirmDeleteIdx = -1; ImGui::CloseCurrentPopup(); }
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) { confirmDeleteIdx_ = -1; ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
     }
 

@@ -54,18 +54,20 @@ static void ResizeRGBA(const unsigned char *src, int sw, int sh, unsigned char *
   }
 }
 
+// Copy a smaller (rw x rh) RGBA image into the center of an outSize x outSize
+// buffer that is assumed to be pre-allocated and already cleared to transparent.
+static void PlaceCentered(RgbaBuffer &dst, const unsigned char *src, int rw, int rh, int outSize) {
+  int offsetX = (outSize - rw) / 2;
+  int offsetY = (outSize - rh) / 2;
+  for (int y = 0; y < rh; ++y) {
+    std::memcpy(dst.data() + ((y + offsetY) * outSize + offsetX) * 4, src + (y * rw * 4), (size_t)rw * 4);
+  }
+}
+
 // Render a source image into a square (requestedSize x requestedSize) RGBA buffer,
 // transparent-padded and centered.
 static RgbaResult LoadImageFile(const std::string &filepath, int &w, int &h, int &channels, int requestedSize) {
   RgbaBuffer data;
-
-  auto fillCentered = [&](unsigned char *temp, int rw, int rh) {
-    int offsetX = (w - rw) / 2;
-    int offsetY = (h - rh) / 2;
-    for (int y = 0; y < rh; ++y) {
-      std::memcpy(data.data() + ((y + offsetY) * w + offsetX) * 4, temp + (y * rw * 4), (size_t)rw * 4);
-    }
-  };
 
   if (EndsWith(filepath, ".svg") || EndsWith(filepath, ".SVG")) {
     NSVGimage *image = nsvgParseFromFile(filepath.c_str(), "px", 96.0f);
@@ -91,7 +93,7 @@ static RgbaResult LoadImageFile(const std::string &filepath, int &w, int &h, int
     RgbaBuffer temp((size_t)rw * rh * 4);
     NSVGrasterizer *rast = nsvgCreateRasterizer();
     nsvgRasterize(rast, image, 0, 0, scale, temp.data(), rw, rh, rw * 4);
-    fillCentered(temp.data(), rw, rh);
+    PlaceCentered(data, temp.data(), rw, rh, requestedSize);
 
     nsvgDeleteRasterizer(rast);
     nsvgDelete(image);
@@ -115,7 +117,7 @@ static RgbaResult LoadImageFile(const std::string &filepath, int &w, int &h, int
 
   RgbaBuffer temp((size_t)rw * rh * 4);
   ResizeRGBA(src, sw, sh, temp.data(), rw, rh);
-  fillCentered(temp.data(), rw, rh);
+  PlaceCentered(data, temp.data(), rw, rh, requestedSize);
 
   stbi_image_free(src);
   channels = 4;
@@ -217,12 +219,8 @@ static RgbaResult LoadImageData(const unsigned char *inputData, unsigned int inp
   RgbaBuffer temp((size_t)rw * rh * 4);
   ResizeRGBA(src, sw, sh, temp.data(), rw, rh);
 
-  // Center in square buffer
-  int offsetX = (w - rw) / 2;
-  int offsetY = (h - rh) / 2;
-  for (int y = 0; y < rh; ++y) {
-    std::memcpy(data.data() + ((y + offsetY) * w + offsetX) * 4, temp.data() + (y * rw * 4), (size_t)rw * 4);
-  }
+  // Center the resized image in the square buffer
+  PlaceCentered(data, temp.data(), rw, rh, requestedSize);
 
   stbi_image_free(src);
   channels = 4;
