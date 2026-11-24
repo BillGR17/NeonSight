@@ -1107,7 +1107,7 @@ void TrayIcon::XEmbedLoop() {
   // Helper: build a fresh XImage scaled to (w, h) from iconPixels_
   // Caller is responsible for XDestroyImage when done (which also frees buf).
   auto buildImage = [&](int w, int h) -> XImage * {
-    auto *buf = static_cast<uint32_t *>(std::malloc(static_cast<size_t>(w * h) * 4));
+    auto buf = std::make_unique<uint32_t[]>(static_cast<size_t>(w * h));
     if (!buf)
       return nullptr;
 
@@ -1130,9 +1130,7 @@ void TrayIcon::XEmbedLoop() {
     }
 
     XImage *img = XCreateImage(dpy, DefaultVisual(dpy, screen), static_cast<unsigned>(DefaultDepth(dpy, screen)), ZPixmap, 0,
-                               reinterpret_cast<char *>(buf), static_cast<unsigned>(w), static_cast<unsigned>(h), 32, 0);
-    if (!img)
-      std::free(buf);
+                               reinterpret_cast<char *>(buf.release()), static_cast<unsigned>(w), static_cast<unsigned>(h), 32, 0);
     return img;
   };
 
